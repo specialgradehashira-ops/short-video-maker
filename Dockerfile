@@ -11,7 +11,7 @@ WORKDIR /app
 
 # Install deps (we'll add package.json in the next steps)
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # Copy app source (we'll add server.js next)
 COPY . .
