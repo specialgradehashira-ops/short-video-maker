@@ -1,10 +1,14 @@
 import express from "express";
 import fetch from "node-fetch";
 import { promises as fs } from "fs";
+import { createWriteStream } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import crypto from "crypto";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import * as googleTTS from "google-tts-api";
 
 /* ---------- Setup ---------- */
 const __filename = fileURLToPath(import.meta.url);
@@ -15,7 +19,7 @@ const TMP_DIR = "/tmp";
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-// CORS so you can call from Hoppscotch/Postman Web
+// CORS (so Hoppscotch/Postman Web can call you)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-webhook-secret");
@@ -24,11 +28,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve finished files so n8n (or you) can download immediately
+// Serve finished files
 app.use("/files", express.static(OUT_DIR, { maxAge: "1h", fallthrough: true }));
 
-// Simple health check
-app.get("/healthz", (_, res) => res.status(200).send("ok"));
+// Health / Debug
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+app.get("/debug/list", async (_req, res) => {
+  try { await ensureDirs(); const files = await fs.readdir(OUT_DIR); res.json({ outDir: OUT_DIR, files }); }
+  catch (e) { res.status(500).json({ error: e?.message || "read dir failed" }); }
+});
 
 /* ---------- Helpers ---------- */
 function baseUrl(req) {
@@ -47,11 +55,13 @@ async function ensureDirs() {
   await fs.mkdir(OUT_DIR, { recursive: true });
 }
 
+// STREAM download (memory-safe)
 async function downloadTo(fileUrl, destPath, headers = {}) {
   const res = await fetch(fileUrl, { headers });
   if (!res.ok) throw new Error(`Download failed ${res.status} ${res.statusText}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fs.writeFile(destPath, buf);
+  await fs.mkdir(path.dirname(destPath), { recursive: true });
+  const nodeStream = Readable.fromWeb(res.body);
+  await pipeline(nodeStream, createWriteStream(destPath));
   return destPath;
 }
 
@@ -76,9 +86,7 @@ function sanitizeForDrawtext(text) {
     .replace(/\n/g, "\\n");
 }
 
-/* ---------- TTS (free, no key) ---------- */
-import * as googleTTS from "google-tts-api";
-
+/* ---------- Media utils ---------- */
 async function getDurationSec(filePath) {
   return new Promise((resolve, reject) => {
     const p = spawn("ffprobe", ["-v","quiet","-print_format","json","-show_format", filePath], { stdio: ["ignore","pipe","pipe"] });
@@ -147,6 +155,8 @@ function pickVideoFileForOrientation(video, orientation="portrait") {
   return candidates[0];
 }
 
+// Change to 720x1280 portrait if you want lighter encodes:
+// return orientation === "portrait" ? "scale=-2:1280,crop=720:1280" : "scale=1280:-2,crop=1280:720";
 function scaleCropFor(orientation="portrait") {
   return orientation === "portrait"
     ? "scale=-2:1920,crop=1080:1920"
@@ -176,28 +186,29 @@ async function makeSubsegment(srcUrl, takeSec, idx, orientation, text, textPosit
     "-preset", "veryfast",
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart",
+    "-threads", "1",
     segPath
   ]);
   return segPath;
 }
 
-// Build one scene: TTS voice + multiple DIFFERENT clips (no loops) to cover voice length
+// Build one scene: TTS voice + several DIFFERENT clips (no loops) to cover the voice length
 async function buildSceneWithVoice(scene, idx, orientation="portrait", textPosition="bottom") {
   const { text="", search="", minClipSec=4, maxClips=4, lang="en" } = scene || {};
   const q = (search || text || "nature");
 
   // 1) TTS for this scene
   const { voicePath, durationSec: vSec } = await ttsForScene(text, lang);
-  const targetSec = Math.max(3, Math.min(60, vSec)); // keep per-scene reasonable on free tier
+  const targetSec = Math.max(3, Math.min(60, vSec)); // per-scene cap (free tier friendly)
 
-  // 2) Candidate clips
+  // 2) Get candidate clips
   const pool = await fetchPexelsPool(q, 25);
   if (!pool.length) throw new Error(`No stock videos for "${q}"`);
   const oriented = pool.map(v => ({ v, file: pickVideoFileForOrientation(v, orientation), dur: Number(v.duration||0) }))
                       .filter(x => x.file && x.file.link);
   oriented.sort((a,b)=> (b.dur||0) - (a.dur||0));
 
-  // 3) Choose several different clips to cover targetSec
+  // 3) Choose several different clips to cover the target time
   const chosen = [];
   let remaining = targetSec;
   for (const cand of oriented) {
@@ -212,7 +223,7 @@ async function buildSceneWithVoice(scene, idx, orientation="portrait", textPosit
     chosen.push({ url: oriented[0].file.link, take: Math.min(targetSec, Math.max(minClipSec, oriented[0].dur||minClipSec)) });
   }
 
-  // 4) Normalize each piece with caption
+  // 4) Normalize each piece (captioned)
   const segParts = [];
   for (let i=0;i<chosen.length;i++) {
     const part = chosen[i];
@@ -228,6 +239,7 @@ async function buildSceneWithVoice(scene, idx, orientation="portrait", textPosit
     "-y","-f","concat","-safe","0","-i",listPath,
     "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
     "-movflags","+faststart",
+    "-threads","1",
     sceneVideo
   ]);
 
@@ -241,6 +253,7 @@ async function concatSegments(segPaths, outPath) {
     "-y","-f","concat","-safe","0","-i",listPath,
     "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
     "-movflags","+faststart",
+    "-threads","1",
     outPath
   ]);
 }
@@ -280,15 +293,15 @@ app.post("/render", async (req, res) => {
       voicePaths.push(voicePath);
     }
 
-    // Concat videos
+    // Concat videos (video-only)
     const videoOnly = path.join(TMP_DIR, `video-${crypto.randomBytes(5).toString("hex")}.mp4`);
     await concatSegments(segPaths, videoOnly);
 
-    // Concat voices
+    // Concat voice audios
     const voiceAll = path.join(TMP_DIR, `voice-${crypto.randomBytes(5).toString("hex")}.mp3`);
     await concatAudio(voicePaths, voiceAll);
 
-    // Mux video + voice
+    // Mux video + voice (copy video; encode audio)
     const outId = crypto.randomBytes(6).toString("hex");
     const outPath = path.join(OUT_DIR, `video-${outId}.${outFormat}`);
     await runFfmpeg([
