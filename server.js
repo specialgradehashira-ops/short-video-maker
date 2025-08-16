@@ -55,15 +55,30 @@ async function ensureDirs() {
   await fs.mkdir(OUT_DIR, { recursive: true });
 }
 
-// STREAM download (memory-safe)
+// STREAM download (works with both Web streams & Node streams)
 async function downloadTo(fileUrl, destPath, headers = {}) {
   const res = await fetch(fileUrl, { headers });
   if (!res.ok) throw new Error(`Download failed ${res.status} ${res.statusText}`);
+
   await fs.mkdir(path.dirname(destPath), { recursive: true });
-  const nodeStream = Readable.fromWeb(res.body);
-  await pipeline(nodeStream, createWriteStream(destPath));
-  return destPath;
+  const out = createWriteStream(destPath);
+
+  // If body is a Node stream (PassThrough), it has .pipe()
+  if (res.body && typeof res.body.pipe === "function") {
+    await pipeline(res.body, out);
+    return destPath;
+  }
+
+  // Otherwise treat it as a Web ReadableStream
+  if (res.body) {
+    const nodeStream = Readable.fromWeb(res.body);
+    await pipeline(nodeStream, out);
+    return destPath;
+  }
+
+  throw new Error("No response body to download");
 }
+
 
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
