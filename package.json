@@ -4,9 +4,12 @@
   "type": "module",
   "main": "server.js",
   "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "google-tts-api": "^2.0.2"
+    "google-tts-api": "^2.0.2",
+    "node-fetch": "^3.3.2"
   }
 }
