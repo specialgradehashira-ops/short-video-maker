@@ -1,6 +1,6 @@
 FROM node:18-bullseye
 
-# ffmpeg (incl. ffprobe) + a readable font + curl (handy for healthchecks)
+# ffmpeg (incl. ffprobe) + a readable font + curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-dejavu-core \
@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install deps first (better layer caching)
+# Install deps first for better caching
 COPY package*.json ./
 RUN npm install --omit=dev
 
