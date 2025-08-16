@@ -19,7 +19,7 @@ const TMP_DIR = "/tmp";
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-// CORS (so Hoppscotch/Postman Web can call you)
+// CORS (Hoppscotch/Postman Web)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-webhook-secret");
@@ -55,30 +55,24 @@ async function ensureDirs() {
   await fs.mkdir(OUT_DIR, { recursive: true });
 }
 
-// STREAM download (works with both Web streams & Node streams)
+// STREAM download (works for Node & Web streams, no RAM spikes)
 async function downloadTo(fileUrl, destPath, headers = {}) {
   const res = await fetch(fileUrl, { headers });
   if (!res.ok) throw new Error(`Download failed ${res.status} ${res.statusText}`);
-
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   const out = createWriteStream(destPath);
 
-  // If body is a Node stream (PassThrough), it has .pipe()
   if (res.body && typeof res.body.pipe === "function") {
-    await pipeline(res.body, out);
+    await pipeline(res.body, out);             // Node stream (PassThrough)
     return destPath;
   }
-
-  // Otherwise treat it as a Web ReadableStream
   if (res.body) {
-    const nodeStream = Readable.fromWeb(res.body);
+    const nodeStream = Readable.fromWeb(res.body); // Web ReadableStream
     await pipeline(nodeStream, out);
     return destPath;
   }
-
   throw new Error("No response body to download");
 }
-
 
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
@@ -94,16 +88,15 @@ function runFfmpeg(args) {
 
 function sanitizeForDrawtext(text) {
   return (text || "")
-    .replace(/\\/g, "\\\\")     // backslash
-    .replace(/:/g, "\\:")       // colon
-    .replace(/'/g, "\\'")       // single quote
-    .replace(/%/g, "\\%")       // percent
-    .replace(/,/g, "\\,")       // <-- IMPORTANT: comma
-    .replace(/\[/g, "\\[")      // brackets (safer)
-    .replace(/\]/g, "\\]")      // brackets (safer)
-    .replace(/\n/g, "\\n");     // newlines
+    .replace(/\\/g, "\\\\")     // \
+    .replace(/:/g, "\\:")       // :
+    .replace(/'/g, "\\'")       // '
+    .replace(/%/g, "\\%")       // %
+    .replace(/,/g, "\\,")       // ,
+    .replace(/\[/g, "\\[")      // [
+    .replace(/\]/g, "\\]")      // ]
+    .replace(/\n/g, "\\n");     // newline
 }
-
 
 /* ---------- Media utils ---------- */
 async function getDurationSec(filePath) {
@@ -126,9 +119,7 @@ function splitForTTS(text, maxLen=180) {
   let buf = "";
   for (const ch of (text || "").trim()) {
     buf += ch;
-    if (buf.length >= maxLen && /[\.!\?,;:]$/.test(buf)) {
-      parts.push(buf.trim()); buf = "";
-    }
+    if (buf.length >= maxLen && /[\.!\?,;:]$/.test(buf)) { parts.push(buf.trim()); buf = ""; }
   }
   if (buf.trim()) parts.push(buf.trim());
   return parts.length ? parts : [text];
@@ -174,12 +165,12 @@ function pickVideoFileForOrientation(video, orientation="portrait") {
   return candidates[0];
 }
 
-// Change to 720x1280 portrait if you want lighter encodes:
-// return orientation === "portrait" ? "scale=-2:1280,crop=720:1280" : "scale=1280:-2,crop=1280:720";
+// Use 720x1280 portrait by default to keep free-tier CPU/RAM lower.
+// To switch back to 1080x1920, change 1280->1920 and 720->1080.
 function scaleCropFor(orientation="portrait") {
   return orientation === "portrait"
-    ? "scale=-2:1920,crop=1080:1920"
-    : "scale=1920:-2,crop=1920:1080";
+    ? "scale=-2:1280,crop=720:1280"
+    : "scale=1280:-2,crop=1280:720";
 }
 
 function drawtextFilter(text, position="bottom") {
@@ -193,7 +184,7 @@ function drawtextFilter(text, position="bottom") {
 async function makeSubsegment(srcUrl, takeSec, idx, orientation, text, textPosition) {
   const srcPath = path.join(TMP_DIR, `src-${idx}-${crypto.randomBytes(4).toString("hex")}.mp4`);
   await downloadTo(srcUrl, srcPath);
-  const vf = [ scaleCropFor(orientation), drawtextFilter(text, textPosition), "format=yuv420p" ].join(",");
+  const vf = `${scaleCropFor(orientation)},${drawtextFilter(text, textPosition)}`;
   const segPath = path.join(TMP_DIR, `seg-${idx}-${crypto.randomBytes(4).toString("hex")}.mp4`);
   await runFfmpeg([
     "-y",
@@ -218,7 +209,7 @@ async function buildSceneWithVoice(scene, idx, orientation="portrait", textPosit
 
   // 1) TTS for this scene
   const { voicePath, durationSec: vSec } = await ttsForScene(text, lang);
-  const targetSec = Math.max(3, Math.min(60, vSec)); // per-scene cap (free tier friendly)
+  const targetSec = Math.max(3, Math.min(60, vSec)); // per-scene cap for free tier
 
   // 2) Get candidate clips
   const pool = await fetchPexelsPool(q, 25);
@@ -316,7 +307,7 @@ app.post("/render", async (req, res) => {
     const videoOnly = path.join(TMP_DIR, `video-${crypto.randomBytes(5).toString("hex")}.mp4`);
     await concatSegments(segPaths, videoOnly);
 
-    // Concat voice audios
+    // Concat voices
     const voiceAll = path.join(TMP_DIR, `voice-${crypto.randomBytes(5).toString("hex")}.mp3`);
     await concatAudio(voicePaths, voiceAll);
 
