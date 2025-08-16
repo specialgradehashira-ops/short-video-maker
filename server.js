@@ -94,12 +94,16 @@ function runFfmpeg(args) {
 
 function sanitizeForDrawtext(text) {
   return (text || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'")
-    .replace(/%/g, "\\%")
-    .replace(/\n/g, "\\n");
+    .replace(/\\/g, "\\\\")     // backslash
+    .replace(/:/g, "\\:")       // colon
+    .replace(/'/g, "\\'")       // single quote
+    .replace(/%/g, "\\%")       // percent
+    .replace(/,/g, "\\,")       // <-- IMPORTANT: comma
+    .replace(/\[/g, "\\[")      // brackets (safer)
+    .replace(/\]/g, "\\]")      // brackets (safer)
+    .replace(/\n/g, "\\n");     // newlines
 }
+
 
 /* ---------- Media utils ---------- */
 async function getDurationSec(filePath) {
