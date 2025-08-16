@@ -6,17 +6,16 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import crypto from "crypto";
 
+/* ---------- Setup ---------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Where finished videos are served from
 const OUT_DIR = "/tmp/out";
 const TMP_DIR = "/tmp";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-// Allow browser clients (Hoppscotch/Postman Web) to call us
+// CORS so you can call from Hoppscotch/Postman Web
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-webhook-secret");
@@ -25,21 +24,19 @@ app.use((req, res, next) => {
   next();
 });
 
-
-// Serve finished files so n8n can download them immediately
+// Serve finished files so n8n (or you) can download immediately
 app.use("/files", express.static(OUT_DIR, { maxAge: "1h", fallthrough: true }));
 
-// Health check for uptime pings
+// Simple health check
 app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
-// Helper: detect public base URL (Render sets x-forwarded-* headers)
+/* ---------- Helpers ---------- */
 function baseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || "http").toString();
   const host = (req.headers["x-forwarded-host"] || req.headers.host || "").toString();
   return `${proto}://${host}`;
 }
 
-// Simple shared-secret check so only your n8n can call this
 function verifySecret(req) {
   const sent = req.get("x-webhook-secret") || "";
   const expected = process.env.WEBHOOK_SECRET || "";
@@ -50,7 +47,6 @@ async function ensureDirs() {
   await fs.mkdir(OUT_DIR, { recursive: true });
 }
 
-// Download any URL to a local path
 async function downloadTo(fileUrl, destPath, headers = {}) {
   const res = await fetch(fileUrl, { headers });
   if (!res.ok) throw new Error(`Download failed ${res.status} ${res.statusText}`);
@@ -59,120 +55,267 @@ async function downloadTo(fileUrl, destPath, headers = {}) {
   return destPath;
 }
 
-// Get one stock clip from Pexels (requires PEXELS_API_KEY env var)
-async function fetchPexelsClip(query) {
-  const key = process.env.PEXELS_API_KEY;
-  if (!key) throw new Error("Missing PEXELS_API_KEY");
-  const url = `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=1`;
-  const res = await fetch(url, { headers: { Authorization: key } });
-  if (!res.ok) throw new Error(`Pexels API error ${res.status}`);
-  const json = await res.json();
-
-  if (!json.videos?.length) throw new Error("No stock videos found for query");
-  const first = json.videos[0];
-  const file = first.video_files?.[0];
-  if (!file?.link) throw new Error("No downloadable video file link");
-  return file.link;
-}
-
-// Run ffmpeg and capture errors
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
-    p.stderr.on("data", (d) => (stderr += d.toString()));
+    p.stderr.on("data", d => (stderr += d.toString()));
     p.on("close", (code) => {
       if (code === 0) resolve(true);
-      else reject(new Error(`ffmpeg exited ${code}:\n${stderr.split("\n").slice(-10).join("\n")}`));
+      else reject(new Error(`ffmpeg exited ${code}:\n${stderr.split("\n").slice(-12).join("\n")}`));
     });
   });
 }
 
-// Escape special chars for ffmpeg drawtext
 function sanitizeForDrawtext(text) {
   return (text || "")
-    .replace(/\\/g, '\\\\')
-    .replace(/:/g, '\\:')
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
     .replace(/'/g, "\\'")
-    .replace(/%/g, '\\%')
+    .replace(/%/g, "\\%")
     .replace(/\n/g, "\\n");
 }
 
-// Main endpoint: POST /render
+/* ---------- TTS (free, no key) ---------- */
+import * as googleTTS from "google-tts-api";
+
+async function getDurationSec(filePath) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ffprobe", ["-v","quiet","-print_format","json","-show_format", filePath], { stdio: ["ignore","pipe","pipe"] });
+    let out = "";
+    p.stdout.on("data", d => (out += d.toString()));
+    p.on("close", () => {
+      try {
+        const j = JSON.parse(out || "{}");
+        const sec = parseFloat(j?.format?.duration || "0");
+        resolve(isFinite(sec) ? sec : 0);
+      } catch (e) { reject(e); }
+    });
+  });
+}
+
+function splitForTTS(text, maxLen=180) {
+  const parts = [];
+  let buf = "";
+  for (const ch of (text || "").trim()) {
+    buf += ch;
+    if (buf.length >= maxLen && /[\.!\?,;:]$/.test(buf)) {
+      parts.push(buf.trim()); buf = "";
+    }
+  }
+  if (buf.trim()) parts.push(buf.trim());
+  return parts.length ? parts : [text];
+}
+
+async function ttsForScene(text, lang="en") {
+  const id = crypto.randomBytes(5).toString("hex");
+  const chunks = splitForTTS(text);
+  const partPaths = [];
+  for (let i=0;i<chunks.length;i++) {
+    const url = googleTTS.getAudioUrl(chunks[i], { lang, slow:false, host:"https://translate.google.com" });
+    const pth = path.join(TMP_DIR, `vpart-${id}-${i}.mp3`);
+    await downloadTo(url, pth);
+    partPaths.push(pth);
+  }
+  const list = path.join(TMP_DIR, `vlist-${id}.txt`);
+  await fs.writeFile(list, partPaths.map(p => `file '${p}'`).join("\n"));
+  const voicePath = path.join(TMP_DIR, `voice-${id}.mp3`);
+  await runFfmpeg(["-y","-f","concat","-safe","0","-i",list,"-c","copy",voicePath]);
+  const durationSec = await getDurationSec(voicePath);
+  return { voicePath, durationSec };
+}
+
+/* ---------- Pexels + video assembly ---------- */
+async function fetchPexelsPool(query, perPage=25) {
+  const key = process.env.PEXELS_API_KEY;
+  if (!key) throw new Error("Missing PEXELS_API_KEY");
+  const url = `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=${perPage}`;
+  const res = await fetch(url, { headers: { Authorization: key } });
+  if (!res.ok) throw new Error(`Pexels API error ${res.status}`);
+  const json = await res.json();
+  return Array.isArray(json.videos) ? json.videos : [];
+}
+
+function pickVideoFileForOrientation(video, orientation="portrait") {
+  const files = Array.isArray(video.video_files) ? video.video_files : [];
+  let candidates = files.filter(f => {
+    const w = Number(f.width||0), h = Number(f.height||0);
+    return orientation === "portrait" ? h >= w : w >= h;
+  });
+  if (!candidates.length) candidates = files;
+  candidates.sort((a,b)=>(Number(b.width||0)*Number(b.height||0))-(Number(a.width||0)*Number(a.height||0)));
+  return candidates[0];
+}
+
+function scaleCropFor(orientation="portrait") {
+  return orientation === "portrait"
+    ? "scale=-2:1920,crop=1080:1920"
+    : "scale=1920:-2,crop=1920:1080";
+}
+
+function drawtextFilter(text, position="bottom") {
+  const font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+  const safe = sanitizeForDrawtext(text||"");
+  const yExpr = position==="center" ? "(h-text_h)/2" : position==="top" ? "text_h*0.8" : "h-(text_h*2)";
+  const size = safe.length>220 ? 28 : safe.length>120 ? 32 : 36;
+  return `drawtext=fontfile='${font}':text='${safe}':x=(w-text_w)/2:y=${yExpr}:fontsize=${size}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=12:line_spacing=6`;
+}
+
+async function makeSubsegment(srcUrl, takeSec, idx, orientation, text, textPosition) {
+  const srcPath = path.join(TMP_DIR, `src-${idx}-${crypto.randomBytes(4).toString("hex")}.mp4`);
+  await downloadTo(srcUrl, srcPath);
+  const vf = [ scaleCropFor(orientation), drawtextFilter(text, textPosition), "format=yuv420p" ].join(",");
+  const segPath = path.join(TMP_DIR, `seg-${idx}-${crypto.randomBytes(4).toString("hex")}.mp4`);
+  await runFfmpeg([
+    "-y",
+    "-i", srcPath,
+    "-t", String(Math.max(0.6, takeSec)),
+    "-vf", vf,
+    "-an",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-pix_fmt", "yuv420p",
+    "-movflags", "+faststart",
+    segPath
+  ]);
+  return segPath;
+}
+
+// Build one scene: TTS voice + multiple DIFFERENT clips (no loops) to cover voice length
+async function buildSceneWithVoice(scene, idx, orientation="portrait", textPosition="bottom") {
+  const { text="", search="", minClipSec=4, maxClips=4, lang="en" } = scene || {};
+  const q = (search || text || "nature");
+
+  // 1) TTS for this scene
+  const { voicePath, durationSec: vSec } = await ttsForScene(text, lang);
+  const targetSec = Math.max(3, Math.min(60, vSec)); // keep per-scene reasonable on free tier
+
+  // 2) Candidate clips
+  const pool = await fetchPexelsPool(q, 25);
+  if (!pool.length) throw new Error(`No stock videos for "${q}"`);
+  const oriented = pool.map(v => ({ v, file: pickVideoFileForOrientation(v, orientation), dur: Number(v.duration||0) }))
+                      .filter(x => x.file && x.file.link);
+  oriented.sort((a,b)=> (b.dur||0) - (a.dur||0));
+
+  // 3) Choose several different clips to cover targetSec
+  const chosen = [];
+  let remaining = targetSec;
+  for (const cand of oriented) {
+    if (chosen.length >= maxClips) break;
+    const take = Math.min(Math.max(minClipSec, Math.min(cand.dur || minClipSec, remaining)), remaining);
+    if (take <= 0.75) continue;
+    chosen.push({ url: cand.file.link, take });
+    remaining -= take;
+    if (remaining <= 0.75) break;
+  }
+  if (chosen.length === 0) {
+    chosen.push({ url: oriented[0].file.link, take: Math.min(targetSec, Math.max(minClipSec, oriented[0].dur||minClipSec)) });
+  }
+
+  // 4) Normalize each piece with caption
+  const segParts = [];
+  for (let i=0;i<chosen.length;i++) {
+    const part = chosen[i];
+    const seg = await makeSubsegment(part.url, part.take, `${idx}-${i}`, orientation, text, textPosition);
+    segParts.push(seg);
+  }
+
+  // 5) Concat to one scene video (video-only)
+  const listPath = path.join(TMP_DIR, `list-${idx}-${crypto.randomBytes(4).toString("hex")}.txt`);
+  await fs.writeFile(listPath, segParts.map(p => `file '${p}'`).join("\n"));
+  const sceneVideo = path.join(TMP_DIR, `scene-${idx}-${crypto.randomBytes(4).toString("hex")}.mp4`);
+  await runFfmpeg([
+    "-y","-f","concat","-safe","0","-i",listPath,
+    "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
+    "-movflags","+faststart",
+    sceneVideo
+  ]);
+
+  return { segPath: sceneVideo, voicePath };
+}
+
+async function concatSegments(segPaths, outPath) {
+  const listPath = path.join(TMP_DIR, `concat-${crypto.randomBytes(5).toString("hex")}.txt`);
+  await fs.writeFile(listPath, segPaths.map(p => `file '${p}'`).join("\n"));
+  await runFfmpeg([
+    "-y","-f","concat","-safe","0","-i",listPath,
+    "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
+    "-movflags","+faststart",
+    outPath
+  ]);
+}
+
+async function concatAudio(mp3Paths, outPath) {
+  const listPath = path.join(TMP_DIR, `alist-${crypto.randomBytes(5).toString("hex")}.txt`);
+  await fs.writeFile(listPath, mp3Paths.map(p => `file '${p}'`).join("\n"));
+  await runFfmpeg(["-y","-f","concat","-safe","0","-i",listPath,"-c","copy",outPath]);
+}
+
+/* ---------- API ---------- */
 app.post("/render", async (req, res) => {
   try {
     if (!verifySecret(req)) return res.status(401).json({ error: "Unauthorized" });
 
-    const started = Date.now();
-    const timeoutSec = Number(process.env.MAX_RENDER_SECONDS || 300);
-    const timeLeft = () => timeoutSec - Math.floor((Date.now() - started) / 1000);
-    if (timeLeft() <= 0) return res.status(504).json({ error: "Timeout before start" });
-
-    // Inputs from n8n (all optional with defaults)
     let {
-      scriptText = "Your on-screen caption text goes here.",
-      stockQuery = "city sunrise",
-      musicUrl = "",
-      outFormat = "mp4",
-      textPosition = "bottom" // 'bottom' or 'center'
+      scenes = [],                 // [{ text, search, minClipSec?, maxClips?, lang? }, ...]
+      orientation = "portrait",    // "portrait" | "landscape"
+      textPosition = "bottom",     // "bottom" | "center" | "top"
+      outFormat = "mp4"
     } = req.body || {};
+
+    if (!Array.isArray(scenes) || scenes.length === 0) {
+      return res.status(400).json({ error: "Provide scenes[] with per-scene text (and optional search)." });
+    }
 
     await ensureDirs();
 
-    // 1) Fetch a stock clip
-    const clipUrl = await fetchPexelsClip(stockQuery);
-    const clipPath = path.join(TMP_DIR, `clip-${crypto.randomBytes(4).toString("hex")}.mp4`);
-    await downloadTo(clipUrl, clipPath);
+    // Build each scene (voice + multi-clip video), then stitch
+    const take = scenes.slice(0, 60); // safety cap for free tier
+    const segPaths = [];
+    const voicePaths = [];
 
-    // 2) Optional background music
-    let musicPath = "";
-    if (musicUrl) {
-      musicPath = path.join(TMP_DIR, `music-${crypto.randomBytes(4).toString("hex")}.mp3`);
-      await downloadTo(musicUrl, musicPath);
+    for (let i = 0; i < take.length; i++) {
+      const { segPath, voicePath } = await buildSceneWithVoice(take[i], i, orientation, textPosition);
+      segPaths.push(segPath);
+      voicePaths.push(voicePath);
     }
 
-    // 3) Overlay caption with drawtext
-    const font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-    const text = sanitizeForDrawtext(scriptText);
+    // Concat videos
+    const videoOnly = path.join(TMP_DIR, `video-${crypto.randomBytes(5).toString("hex")}.mp4`);
+    await concatSegments(segPaths, videoOnly);
 
+    // Concat voices
+    const voiceAll = path.join(TMP_DIR, `voice-${crypto.randomBytes(5).toString("hex")}.mp3`);
+    await concatAudio(voicePaths, voiceAll);
+
+    // Mux video + voice
     const outId = crypto.randomBytes(6).toString("hex");
     const outPath = path.join(OUT_DIR, `video-${outId}.${outFormat}`);
-
-    const yExpr = textPosition === "center" ? "(h-text_h)/2" : "h-(text_h*2)";
-    const vf = [
-      `drawtext=fontfile='${font}':text='${text}':x=(w-text_w)/2:y=${yExpr}:fontsize=36:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=12:line_spacing=6`,
-      "format=yuv420p"
-    ].join(",");
-
-    const args = [
+    await runFfmpeg([
       "-y",
-      "-i", clipPath,
-      ...(musicPath ? ["-i", musicPath] : []),
-      "-filter:v", vf,
-      "-map", "0:v:0",
-      ...(musicPath ? ["-map", "1:a:0"] : []),
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-pix_fmt", "yuv420p",
-      ...(musicPath ? ["-c:a", "aac", "-b:a", "192k"] : []),
+      "-i", videoOnly,
+      "-i", voiceAll,
+      "-map","0:v:0",
+      "-map","1:a:0",
+      "-c:v","copy",
+      "-c:a","aac","-b:a","192k",
       "-shortest",
+      "-movflags","+faststart",
       outPath
-    ];
-
-    await runFfmpeg(args);
+    ]);
 
     const url = `${baseUrl(req)}/files/${path.basename(outPath)}`;
     return res.json({
       status: "done",
       fileUrl: url,
-      meta: { format: outFormat, source: "pexels", query: stockQuery }
+      meta: { mode: "scenes+voice", scenes: segPaths.length, orientation }
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || "Render failed" });
   }
 });
 
-// Start server
+/* ---------- Start ---------- */
 app.listen(process.env.PORT || 8080, () =>
   console.log(`Short-Video Maker listening on ${process.env.PORT || 8080}`)
 );
