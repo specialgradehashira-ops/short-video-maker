@@ -167,11 +167,17 @@ function pickVideoFileForOrientation(video, orientation="portrait") {
 
 // Use 720x1280 portrait by default to keep free-tier CPU/RAM lower.
 // To switch back to 1080x1920, change 1280->1920 and 720->1080.
-function scaleCropFor(orientation="portrait") {
-  return orientation === "portrait"
-    ? "scale=-2:1280,crop=720:1280"
-    : "scale=1280:-2,crop=1280:720";
+// Fit inside the target size while preserving aspect ratio, then pad to fill.
+// Portrait target = 720x1280, Landscape target = 1280x720.
+function scaleCropFor(orientation = "portrait") {
+  if (orientation === "portrait") {
+    // Fit within 720x1280, then pad to exactly 720x1280 (centered)
+    return "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(720-iw)/2:(1280-ih)/2";
+  }
+  // Landscape
+  return "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(1280-iw)/2:(720-ih)/2";
 }
+
 
 function drawtextFilter(text, position="bottom") {
   const font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
